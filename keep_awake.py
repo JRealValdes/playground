@@ -1,4 +1,4 @@
-"""Mueve el ratón periódicamente para evitar que el ordenador se duerma."""
+"""Mantiene el ordenador despierto vía SetThreadExecutionState (API de Windows)."""
 
 from __future__ import annotations
 
@@ -6,35 +6,40 @@ import argparse
 import ctypes
 import sys
 import time
-from ctypes import wintypes
 from datetime import datetime, timedelta
 
 
-user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+# https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate
+ES_CONTINUOUS = 0x80000000
+ES_DISPLAY_REQUIRED = 0x00000002
+ES_SYSTEM_REQUIRED = 0x00000001
 
 
-class POINT(ctypes.Structure):
-    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+def set_execution_state(flags: int) -> int:
+    """Informa a Windows de que el sistema (y opcionalmente la pantalla) deben seguir activos."""
+    previous = kernel32.SetThreadExecutionState(flags)
+    if previous == 0:
+        raise OSError("SetThreadExecutionState falló")
+    return previous
 
 
-def get_cursor_pos() -> tuple[int, int]:
-    point = POINT()
-    if not user32.GetCursorPos(ctypes.byref(point)):
-        raise OSError("No se pudo leer la posición del ratón")
-    return point.x, point.y
+def prevent_sleep(*, keep_display: bool) -> None:
+    flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    if keep_display:
+        flags |= ES_DISPLAY_REQUIRED
+    set_execution_state(flags)
 
 
-def set_cursor_pos(x: int, y: int) -> None:
-    if not user32.SetCursorPos(x, y):
-        raise OSError("No se pudo mover el ratón")
+def allow_sleep() -> None:
+    """Restaura el comportamiento normal de suspensión."""
+    set_execution_state(ES_CONTINUOUS)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Mueve el ratón 1 píxel (alternando izquierda/derecha) "
-            "cada cierto intervalo para mantener el PC despierto."
-        ),
+        description="Impide que Windows suspenda el PC usando SetThreadExecutionState.",
     )
     parser.add_argument(
         "-i",
@@ -42,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=30,
         metavar="SECONDS",
-        help="Segundos entre cada movimiento (default: 30)",
+        help="Segundos entre cada refresco del estado (default: 30)",
     )
     parser.add_argument(
         "-d",
@@ -51,6 +56,11 @@ def parse_args() -> argparse.Namespace:
         default=60,
         metavar="MINUTES",
         help="Minutos totales despierto. 0 = indefinido hasta Ctrl+C (default: 60)",
+    )
+    parser.add_argument(
+        "--allow-display-off",
+        action="store_true",
+        help="Permite apagar la pantalla; el sistema sigue sin suspenderse",
     )
     args = parser.parse_args()
 
@@ -73,8 +83,8 @@ def main() -> int:
     args = parse_args()
     start = datetime.now()
     end = None if args.duration == 0 else start + timedelta(minutes=args.duration)
-    direction = 1
-    move_count = 0
+    tick_count = 0
+    keep_display = not args.allow_display_off
 
     print()
     print("=== Keep Awake ===")
@@ -83,10 +93,14 @@ def main() -> int:
         print("Duración  : indefinida (Ctrl+C para parar)")
     else:
         print(f"Duración  : {args.duration:g} minuto(s) (hasta {end.strftime('%H:%M:%S')})")
+    print(f"Pantalla  : {'encendida' if keep_display else 'puede apagarse'}")
     print("Pulsa Ctrl+C para detener antes de tiempo.")
     print()
 
     try:
+        prevent_sleep(keep_display=keep_display)
+        print("[00:00:00] Windows informado: no suspender.")
+
         while True:
             now = datetime.now()
             if end is not None and now >= end:
@@ -94,18 +108,11 @@ def main() -> int:
                 print(f"[{elapsed}] Tiempo total alcanzado. Deteniendo.")
                 break
 
-            x, y = get_cursor_pos()
-            new_x = x + direction
-            set_cursor_pos(new_x, y)
-
-            move_count += 1
-            direction_label = "derecha" if direction == 1 else "izquierda"
+            # Reafirmar periódicamente (más fiable en algunos equipos / Modern Standby)
+            prevent_sleep(keep_display=keep_display)
+            tick_count += 1
             elapsed = format_elapsed((datetime.now() - start).total_seconds())
-            print(
-                f"[{elapsed}] Movimiento #{move_count} → 1 px a la "
-                f"{direction_label} (x: {x} → {new_x})"
-            )
-            direction = -direction
+            print(f"[{elapsed}] Refresco #{tick_count}: sistema mantenido despierto")
 
             if end is None:
                 time.sleep(args.interval)
@@ -119,8 +126,13 @@ def main() -> int:
         elapsed = format_elapsed((datetime.now() - start).total_seconds())
         print(f"[{elapsed}] Cancelado por el usuario.")
     finally:
+        try:
+            allow_sleep()
+            print("Comportamiento normal de suspensión restaurado.")
+        except OSError as exc:
+            print(f"No se pudo restaurar el estado de suspensión: {exc}", file=sys.stderr)
         print()
-        print(f"Listo. Total de movimientos: {move_count}")
+        print(f"Listo. Total de refrescos: {tick_count}")
 
     return 0
 
